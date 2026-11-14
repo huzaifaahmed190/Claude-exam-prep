@@ -1,0 +1,99 @@
+name: Daily Lesson
+
+on:
+  schedule:
+    - cron: "0 16 * * *" # 9pm PKT (UTC+5)
+  workflow_dispatch:
+
+concurrency:
+  group: daily-lesson
+  cancel-in-progress: false # never cancel mid-run: a rotated refresh token could be lost
+
+permissions:
+  contents: write
+
+jobs:
+  lesson:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # The refresh token rotates on every use, so the new one must be saved
+      # back to the secret immediately, before anything else can fail.
+      - name: Get connector access token and rotate refresh token
+        env:
+          ZIA_REFRESH_TOKEN: ${{ secrets.ZIA_REFRESH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          node --input-type=module <<'EOF'
+          import fs from "node:fs";
+          import { execFileSync } from "node:child_process";
+          const r = await fetch("https://auth.panaversity.org/api/auth/oauth2/token", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+              grant_type: "refresh_token",
+              refresh_token: process.env.ZIA_REFRESH_TOKEN,
+              client_id: "zia-tutor-ai",
+              resource: "https://sor.panaversity.org/mcp",
+            }),
+          });
+          const j = await r.json();
+          if (!r.ok || !j.access_token) {
+            console.error("Token refresh failed:", r.status, j.error, j.error_description);
+            process.exit(1);
+          }
+          console.log("::add-mask::" + j.access_token);
+          if (j.refresh_token) {
+            console.log("::add-mask::" + j.refresh_token);
+            execFileSync("gh", ["secret", "set", "ZIA_REFRESH_TOKEN", "-R", process.env.GITHUB_REPOSITORY],
+              { input: j.refresh_token, stdio: ["pipe", "inherit", "inherit"] });
+          }
+          const cfg = { mcpServers: { "agent-factory-sor": {
+            type: "http",
+            url: "https://sor.panaversity.org/mcp",
+            headers: { Authorization: "Bearer " + j.access_token },
+          } } };
+          fs.writeFileSync(process.env.RUNNER_TEMP + "/mcp.json", JSON.stringify(cfg));
+          EOF
+
+      - name: Write today's lesson with Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are writing today's lesson for the FDE role track, using the
+            Agent Factory System of Record MCP server (tools are prefixed
+            mcp__agent-factory-sor__).
+
+            1. Call begin_session first, before any other tool.
+            2. Use the connector's tools to find the learner's current course and
+               the next concept they have not covered. Look at the existing files
+               in lessons/ so you never repeat a topic.
+            3. Read that concept's source material through the connector. Teach only
+               what the connector returns, never from your own recall.
+            4. Write ONE lesson to lessons/${{ github.run_id }}-draft.md. Include: what it is,
+               why it works that way, what breaks without it, a short worked example,
+               and 4 multiple-choice quiz questions with answers at the end.
+            5. Do NOT call update_student_record or any tool that changes the learner
+               record. This is a read-only run.
+            Do not run git commands; a later step commits the file.
+          claude_args: |
+            --mcp-config ${{ runner.temp }}/mcp.json
+            --max-turns 25
+            --allowedTools "mcp__agent-factory-sor__*,Read,Write,Glob,Grep"
+
+      - name: Name and commit the lesson
+        run: |
+          set -e
+          f=$(ls lessons/*-draft.md 2>/dev/null | head -n1 || true)
+          if [ -z "$f" ]; then echo "No lesson was written"; exit 1; fi
+          slug=$(grep -m1 '^# ' "$f" | sed 's/^# //' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g; s/^-//; s/-$//' | cut -c1-50)
+          dest="lessons/$(date -u +%F)-${slug:-lesson}.md"
+          git mv -f "$f" "$dest" 2>/dev/null || mv "$f" "$dest"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$dest"
+          git commit -m "Add daily FDE lesson $(date -u +%F)"
+          git push
