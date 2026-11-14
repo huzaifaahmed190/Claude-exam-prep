@@ -19,6 +19,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Preflight: the refresh token rotates on use, so make sure we can save the
+      # new one BEFORE spending the old one.
+      - name: Check PAT can write secrets
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: gh api "repos/${{ github.repository }}/actions/secrets/public-key" --jq .key_id
+
       # The refresh token rotates on every use, so the new one must be saved
       # back to the secret immediately, before anything else can fail.
       - name: Get connector access token and rotate refresh token
